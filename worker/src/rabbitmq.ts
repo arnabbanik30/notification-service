@@ -1,15 +1,6 @@
-import client, {
-  Connection,
-  Channel,
-  ChannelModel,
-} from "amqplib";
+import client, { Connection, Channel, ChannelModel } from "amqplib";
 
-import {
-  rmqUser,
-  rmqPass,
-  rmqhost,
-  MAIN_QUEUE,
-} from "./config";
+import { rmqUser, rmqPass, rmqhost, MAIN_QUEUE } from "./config";
 
 import { dummyPoster } from "./dummyPoster";
 
@@ -35,7 +26,6 @@ class RabbitMQConnection {
       this.channel = await channelModel.createChannel();
 
       console.log(`🛸 Created RabbitMQ Channel successfully`);
-
     } catch (error) {
       console.error(error);
       console.error(`Not connected to MQ Server`);
@@ -72,20 +62,49 @@ class RabbitMQConnection {
   getRandomIntInclusive(min: number, max: number) {
     const minCeiled = Math.ceil(min);
     const maxFloored = Math.floor(max);
-    return Math.floor(Math.random() * (maxFloored - minCeiled + 1) + minCeiled); 
+    return Math.floor(Math.random() * (maxFloored - minCeiled + 1) + minCeiled);
   }
-  
+
   async postMsg(url: string, payload: string) {
     let provider = this.getRandomIntInclusive(1, 3);
     let res = await dummyPoster(url, provider, payload);
-  
-    if (!res){
-      for (let i = 0; i < 2 && !res; i++){
+
+    if (!res) {
+      for (let i = 0; i < 2 && !res; i++) {
         provider++;
-        res = await dummyPoster(url, provider % 3, payload); 
+        res = await dummyPoster(url, provider % 3, payload);
       }
     }
     return res;
+  }
+
+  async consumeMessage(msg: any) {
+    if (!msg) return;
+    let parsedMsg = JSON.parse(msg.content.toString());
+
+    const { url, payload, attemptCount } = parsedMsg;
+
+    const success = await this.postMsg(url, payload);
+
+    if (success) {
+      this.channel.ack(msg);
+      return;
+    }
+
+    const hasMsgFailedAllAttempts = !(!attemptCount || attemptCount < 5);
+
+    if (hasMsgFailedAllAttempts) {
+      // dead-letter the msg if the delivery fails 5 times.
+      this.channel.nack(msg, false, false);
+      return;
+    }
+    const updatedAttemptCount = !attemptCount ? 1 : attemptCount + 1;
+    await this.sendToRetryQueue(updatedAttemptCount, {
+      url: url,
+      payload: payload,
+      attemptCount: updatedAttemptCount,
+    });
+    this.channel.ack(msg);
   }
 
   async consume(queue: string) {
@@ -95,41 +114,11 @@ class RabbitMQConnection {
       if (!this.channel) {
         await this.connect();
       }
-      if (this.channel) {
-        await this.channel.assertQueue(queue, { durable: true });
-        this.channel.prefetch(1);
-        await this.channel.consume(queue, async (msg) => {
-          if (!msg) return;
-          let strMsg = msg.content.toString();
-          let parsedMsg = JSON.parse(strMsg);
-
-          const {url, payload, attemptCount } = parsedMsg;
-         
-          const success = await this.postMsg(url, payload);
-         
-          if (!success){
-            if (!attemptCount || attemptCount < 5) {
-              // requeue with exponential backoff if the msg is not delivered
-              const updatedAttemptCount = !attemptCount? 1 : attemptCount + 1;
-              await this.sendToRetryQueue(updatedAttemptCount, {
-                url: url,
-                payload: payload,
-                attemptCount: updatedAttemptCount,
-              });
-              this.channel.ack(msg);
-            }
-            else {
-              // dead-letter the msg if the delivery fails 5 times.
-              this.channel.nack(msg, false, false);
-            }
-          }
-          else {
-            this.channel.ack(msg);
-          }
-        });
-      } else {
-        console.log("Channel not available");
-      }
+      await this.channel.assertQueue(queue, { durable: true });
+      this.channel.prefetch(1);
+      await this.channel.consume(queue, async (msg) => {
+        await this.consumeMessage(msg);
+      });
     } catch (error) {
       console.error(error);
       throw error;
